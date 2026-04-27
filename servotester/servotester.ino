@@ -1,64 +1,82 @@
 /*
- * HumanoidTester — 10 серво + 2x BTS7960 (master/slave) + Encoder + PID
+ * ServoTester — кастомный код для ESP32 Arduino core 3.x
+ * Использует ТОЛЬКО LEDC (без MCPWM, без сторонних libs кроме ESP32Encoder)
  *
- * Серво (auto toggle 0° ↔ 90° каждые 3 сек):
- *   GPIO 4, 5, 6, 7, 15, 16, 17, 18, 40, 41
+ * ВАЖНО: ESP32-S3 имеет 8 LEDC каналов.
+ *        4 серво (50Hz) + 4 motor PWM (20kHz) = 8 каналов = РОВНО хватает.
  *
- * Моторы плеча (master/slave):
- *   BTS7960 #1 (master, с энкодером):
- *     GPIO 1  → R_PWM
- *     GPIO 2  → L_PWM
- *     GPIO 14 → R_EN + L_EN
- *   BTS7960 #2 (slave, инвертирован):
- *     GPIO 21 → R_PWM
- *     GPIO 38 → L_PWM
- *     GPIO 39 → R_EN + L_EN
+ *        Чтобы разблокировать оставшиеся 4 серво — купи PCA9685.
  *
- * Encoder REV Core Hex (только на мастере, через voltage divider 5V→3.3V):
- *   GPIO 12 → A
- *   GPIO 13 → B
+ * Активные серво: GPIO 4, 5, 6, 7
+ * Моторы:         BTS7960 master/slave + REV Core Hex encoder
  *
- * Serial команды (115200, Newline):
- *   <num>     target в градусах   (50, 360, -180)
- *   m<num>    raw power           (m100, m-150, m0)
- *   e<num>    set encoder count   (e0 = сброс)
- *   x         стоп target
- *   p/i/d <num>  тюнинг PID
- *   ?         показать PID
- *   sv<0|1>   серво pause/run
+ * Стартовые позиции:
+ *   GPIO 6 → 0°
+ *   Остальные → 0°
  *
- * Библиотеки: ESP32Servo, ESP32Encoder
+ * Команды (115200, Newline):
+ *   <pin> <angle>   серво на угол (4 60, 7 90)
+ *   all <angle>     все серво на угол
+ *   home            все на 0°
+ *   list            показать состояние
+ *   t <deg>         мотор → град (PID)
+ *   m <pwr>         мотор raw power
+ *   e <n>           set encoder count
+ *   x               стоп target
+ *   p/i/d <n>       тюнинг PID
+ *   ?               показать PID
  */
 
-#include <ESP32Servo.h>
 #include <ESP32Encoder.h>
 
-// ─── Серво ───────────────────────────────────────────────────────
-const uint8_t SERVO_PINS[10] = { 4, 5, 6, 7, 15, 16, 17, 18, 40, 41 };
-const uint8_t NUM_SERVOS = 10;
-#define PULSE_MIN_US  500
-#define PULSE_MAX_US  2500
-Servo servos[NUM_SERVOS];
+// ─── Серво — LEDC 50Hz ───────────────────────────────────────────
+const uint8_t  SERVO_PINS[]  = {  4,  5,  6,  7 };
+const uint8_t  INIT_ANGLES[] = {  0,  0,  0,  0 };
+const uint8_t  NUM_SERVOS = sizeof(SERVO_PINS) / sizeof(SERVO_PINS[0]);
 
-bool servoActive = true;
-uint8_t servoAngle = 0;
-unsigned long lastServoToggle = 0;
-const unsigned long SERVO_INTERVAL = 3000;
+const int SERVO_FREQ = 50;
+const int SERVO_RES = 16;
+const uint32_t SERVO_DUTY_MAX = (1UL << SERVO_RES) - 1;
 
-// ─── Моторы BTS7960 ──────────────────────────────────────────────
+uint8_t currentAngles[NUM_SERVOS] = {0};
+
+void servoSetup(uint8_t pin) {
+  ledcAttach(pin, SERVO_FREQ, SERVO_RES);
+}
+
+void servoWrite(uint8_t pin, uint8_t angle) {
+  angle = constrain((int)angle, 0, 180);
+  uint32_t pulseUs = map(angle, 0, 180, 500, 2500);
+  uint32_t duty = (uint32_t)((uint64_t)pulseUs * SERVO_DUTY_MAX / 20000UL);
+  ledcWrite(pin, duty);
+}
+
+// ─── Моторы — LEDC 20kHz ─────────────────────────────────────────
 #define M1_RPWM   1
 #define M1_LPWM   2
 #define M1_EN    14
 #define M2_RPWM  21
 #define M2_LPWM  38
 #define M2_EN    39
-#define PWM_FREQ  20000
-#define PWM_RES   8
+#define MOTOR_FREQ  20000
+#define MOTOR_RES   8
 
 const bool MOTOR1_REVERSED = false;
 const bool MOTOR2_REVERSED = true;
-
 int currentMotorPower = 0;
+
+void setMotors(int16_t power) {
+  power = constrain(power, -255, 255);
+  currentMotorPower = power;
+
+  int16_t pw1 = MOTOR1_REVERSED ? -power : power;
+  if (pw1 >= 0) { ledcWrite(M1_RPWM, pw1); ledcWrite(M1_LPWM, 0); }
+  else          { ledcWrite(M1_RPWM, 0); ledcWrite(M1_LPWM, -pw1); }
+
+  int16_t pw2 = MOTOR2_REVERSED ? -power : power;
+  if (pw2 >= 0) { ledcWrite(M2_RPWM, pw2); ledcWrite(M2_LPWM, 0); }
+  else          { ledcWrite(M2_RPWM, 0); ledcWrite(M2_LPWM, -pw2); }
+}
 
 // ─── Encoder ─────────────────────────────────────────────────────
 #define ENC_A_PIN  12
@@ -86,18 +104,45 @@ const float I_LIMIT = 200;
 unsigned long lastTelemetry = 0;
 const unsigned long TELEMETRY_INTERVAL = 500;
 
-// ─── Управление моторами ────────────────────────────────────────
-void setMotors(int16_t power) {
-  power = constrain(power, -255, 255);
-  currentMotorPower = power;
+// ─── Helpers ─────────────────────────────────────────────────────
+int8_t findServoByPin(uint8_t pin) {
+  for (uint8_t i = 0; i < NUM_SERVOS; i++) {
+    if (SERVO_PINS[i] == pin) return i;
+  }
+  return -1;
+}
 
-  int16_t pw1 = MOTOR1_REVERSED ? -power : power;
-  if (pw1 >= 0) { ledcWrite(M1_RPWM, pw1); ledcWrite(M1_LPWM, 0); }
-  else          { ledcWrite(M1_RPWM, 0); ledcWrite(M1_LPWM, -pw1); }
+void setServoByPin(uint8_t pin, uint8_t angle) {
+  int8_t idx = findServoByPin(pin);
+  if (idx < 0) {
+    Serial.print("[ERR] GPIO "); Serial.print(pin);
+    Serial.println(" не подключён как серво");
+    return;
+  }
+  servoWrite(pin, angle);
+  currentAngles[idx] = angle;
+  Serial.print("[GPIO "); Serial.print(pin);
+  Serial.print("] → "); Serial.print(angle); Serial.println("°");
+}
 
-  int16_t pw2 = MOTOR2_REVERSED ? -power : power;
-  if (pw2 >= 0) { ledcWrite(M2_RPWM, pw2); ledcWrite(M2_LPWM, 0); }
-  else          { ledcWrite(M2_RPWM, 0); ledcWrite(M2_LPWM, -pw2); }
+void setAllServos(uint8_t angle) {
+  for (uint8_t i = 0; i < NUM_SERVOS; i++) {
+    servoWrite(SERVO_PINS[i], angle);
+    currentAngles[i] = angle;
+  }
+  Serial.print("[ALL SERVOS] → "); Serial.print(angle); Serial.println("°");
+}
+
+void listAngles() {
+  Serial.println("─── Серво ───");
+  for (uint8_t i = 0; i < NUM_SERVOS; i++) {
+    Serial.print("  GPIO ");
+    if (SERVO_PINS[i] < 10) Serial.print(" ");
+    Serial.print(SERVO_PINS[i]);
+    Serial.print(" → "); Serial.print(currentAngles[i]); Serial.println("°");
+  }
+  Serial.print("─── Мотор: pwr="); Serial.print(currentMotorPower);
+  Serial.print(", enc="); Serial.println(encoder.getCount());
 }
 
 void resetPid() {
@@ -106,105 +151,120 @@ void resetPid() {
   prevPidTime = millis();
 }
 
-void allServos(uint8_t a) {
-  for (uint8_t i = 0; i < NUM_SERVOS; i++) servos[i].write(a);
-}
-
 void setup() {
   Serial.begin(115200);
   delay(3000);
-  Serial.println("\n=== HumanoidTester ===");
+  Serial.println("\n=== ServoTester (LEDC only, 4 servos + 2 motors) ===");
 
-  // Серво
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
+  // Серво — LEDC 50Hz (каналы 0-3)
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
-    servos[i].setPeriodHertz(50);
-    servos[i].attach(SERVO_PINS[i], PULSE_MIN_US, PULSE_MAX_US);
+    servoSetup(SERVO_PINS[i]);
+    servoWrite(SERVO_PINS[i], INIT_ANGLES[i]);
+    currentAngles[i] = INIT_ANGLES[i];
   }
-  allServos(0);
-  Serial.print("[SERVO] "); Serial.print(NUM_SERVOS); Serial.println(" серво init OK");
+  Serial.print("[SERVO] "); Serial.print(NUM_SERVOS);
+  Serial.println(" серво init OK");
 
-  // Моторы
-  ledcAttach(M1_RPWM, PWM_FREQ, PWM_RES);
-  ledcAttach(M1_LPWM, PWM_FREQ, PWM_RES);
-  ledcAttach(M2_RPWM, PWM_FREQ, PWM_RES);
-  ledcAttach(M2_LPWM, PWM_FREQ, PWM_RES);
-  pinMode(M1_EN, OUTPUT);  digitalWrite(M1_EN, HIGH);
-  pinMode(M2_EN, OUTPUT);  digitalWrite(M2_EN, HIGH);
-  setMotors(0);
-  Serial.println("[MOTOR] BTS7960 #1 + #2 init OK");
-
-  // Encoder
+  // Encoder — ДО listAngles чтобы getCount() не был на neинициал
   ESP32Encoder::useInternalWeakPullResistors = puType::up;
   encoder.attachFullQuad(ENC_A_PIN, ENC_B_PIN);
   encoder.clearCount();
   Serial.println("[ENC] init OK");
 
+  // Моторы — LEDC 20kHz (каналы 4-7)
+  ledcAttach(M1_RPWM, MOTOR_FREQ, MOTOR_RES);
+  ledcAttach(M1_LPWM, MOTOR_FREQ, MOTOR_RES);
+  ledcAttach(M2_RPWM, MOTOR_FREQ, MOTOR_RES);
+  ledcAttach(M2_LPWM, MOTOR_FREQ, MOTOR_RES);
+  pinMode(M1_EN, OUTPUT);  digitalWrite(M1_EN, HIGH);
+  pinMode(M2_EN, OUTPUT);  digitalWrite(M2_EN, HIGH);
+  setMotors(0);
+  Serial.println("[MOTOR] BTS7960 master/slave init OK");
+
+  listAngles();
+
   Serial.println("\nКоманды:");
-  Serial.println("  <num>    target в degrees   (50, 360, -180)");
-  Serial.println("  m<num>   raw power          (m-255..m255)");
-  Serial.println("  e<num>   set encoder        (e0 = сброс)");
-  Serial.println("  x        стоп target");
-  Serial.println("  p/i/d <num>  тюнинг PID");
-  Serial.println("  ?        показать PID");
-  Serial.println("  sv<0|1>  серво pause/run    (sv0 / sv1)");
+  Serial.println("  4 60       серво GPIO 4 → 60°");
+  Serial.println("  all 90     все серво → 90°");
+  Serial.println("  home       все серво → 0°");
+  Serial.println("  list       показать состояние");
+  Serial.println("  t 90       мотор → 90° (PID)");
+  Serial.println("  m 100      мотор raw power");
+  Serial.println("  e 0        сброс encoder");
+  Serial.println("  x          стоп target");
+  Serial.println("  p/i/d <n>  тюнинг PID, ?  показать PID");
 }
 
 void loop() {
-  // ─── Команды ──────────────────────────────────────────────────
   if (Serial.available()) {
     String line = Serial.readStringUntil('\n');
     line.trim();
+    if (line.length() > 0) {
+      line.replace('-', ' ');
+      line.replace(';', ' ');
+      line.replace(',', ' ');
+      line.replace(':', ' ');
+      while (line.indexOf("  ") >= 0) line.replace("  ", " ");
+      line.trim();
 
-    if (line.length() == 0) {
-    } else if (line.startsWith("sv")) {
-      servoActive = (line.substring(2).toInt() != 0);
-      Serial.print("[SERVO] auto = "); Serial.println(servoActive ? "ON" : "OFF");
-    } else if (line[0] == 'm') {
-      targetActive = false;
-      setMotors(line.substring(1).toInt());
-      Serial.print("[POWER] "); Serial.println(currentMotorPower);
-    } else if (line[0] == 'e') {
-      long v = line.substring(1).toInt();
-      encoder.setCount(v);
-      Serial.print("[ENC SET] "); Serial.println(v);
-    } else if (line[0] == 'x') {
-      targetActive = false;
-      setMotors(0);
-      Serial.println("[STOP]");
-    } else if (line[0] == 'p') {
-      kP = line.substring(1).toFloat();  Serial.print("[kP] "); Serial.println(kP);
-    } else if (line[0] == 'i') {
-      kI = line.substring(1).toFloat();  Serial.print("[kI] "); Serial.println(kI);
-    } else if (line[0] == 'd') {
-      kD = line.substring(1).toFloat();  Serial.print("[kD] "); Serial.println(kD);
-    } else if (line[0] == '?') {
-      Serial.print("kP="); Serial.print(kP);
-      Serial.print(" kI="); Serial.print(kI);
-      Serial.print(" kD="); Serial.println(kD);
-    } else if (isDigit(line[0]) || line[0] == '-' || line[0] == '+') {
-      float deg = line.toFloat();
-      targetCounts = (long)(deg * COUNTS_PER_DEG);
-      targetActive = true;
-      resetPid();
-      Serial.print("[TARGET] "); Serial.print(deg);
-      Serial.print("° = "); Serial.println(targetCounts);
-    } else {
-      Serial.print("[ERR] "); Serial.println(line);
+      String cmd = line;
+      cmd.toLowerCase();
+
+      if (cmd == "home") {
+        setAllServos(0);
+      } else if (cmd == "list") {
+        listAngles();
+      } else if (cmd == "x") {
+        targetActive = false;
+        setMotors(0);
+        Serial.println("[STOP]");
+      } else if (cmd == "?") {
+        Serial.print("kP="); Serial.print(kP);
+        Serial.print(" kI="); Serial.print(kI);
+        Serial.print(" kD="); Serial.println(kD);
+      } else if (cmd.startsWith("all ")) {
+        int angle = cmd.substring(4).toInt();
+        if (angle >= 0 && angle <= 180) setAllServos((uint8_t)angle);
+        else Serial.println("[ERR] угол 0-180");
+      } else if (cmd.startsWith("t ")) {
+        float deg = cmd.substring(2).toFloat();
+        targetCounts = (long)(deg * COUNTS_PER_DEG);
+        targetActive = true;
+        resetPid();
+        Serial.print("[TARGET] "); Serial.print(deg);
+        Serial.print("° = "); Serial.println(targetCounts);
+      } else if (cmd.startsWith("m ")) {
+        targetActive = false;
+        setMotors(cmd.substring(2).toInt());
+        Serial.print("[POWER] "); Serial.println(currentMotorPower);
+      } else if (cmd.startsWith("e ")) {
+        long v = cmd.substring(2).toInt();
+        encoder.setCount(v);
+        Serial.print("[ENC SET] "); Serial.println(v);
+      } else if (cmd.startsWith("p ")) {
+        kP = cmd.substring(2).toFloat();  Serial.print("[kP] "); Serial.println(kP);
+      } else if (cmd.startsWith("i ")) {
+        kI = cmd.substring(2).toFloat();  Serial.print("[kI] "); Serial.println(kI);
+      } else if (cmd.startsWith("d ")) {
+        kD = cmd.substring(2).toFloat();  Serial.print("[kD] "); Serial.println(kD);
+      } else {
+        int spaceIdx = cmd.indexOf(' ');
+        if (spaceIdx < 0) {
+          Serial.print("[ERR] неизвестная команда: "); Serial.println(line);
+          return;
+        }
+        int pin = cmd.substring(0, spaceIdx).toInt();
+        int angle = cmd.substring(spaceIdx + 1).toInt();
+        if (angle < 0 || angle > 180) {
+          Serial.println("[ERR] угол 0-180");
+          return;
+        }
+        setServoByPin((uint8_t)pin, (uint8_t)angle);
+      }
     }
   }
 
-  // ─── Серво auto toggle ────────────────────────────────────────
-  if (servoActive && (millis() - lastServoToggle > SERVO_INTERVAL)) {
-    servoAngle = (servoAngle == 0) ? 90 : 0;
-    allServos(servoAngle);
-    lastServoToggle = millis();
-  }
-
-  // ─── PID для моторов ──────────────────────────────────────────
+  // PID
   if (targetActive) {
     long current = encoder.getCount();
     long error = targetCounts - current;
@@ -237,21 +297,12 @@ void loop() {
     }
   }
 
-  // ─── Telemetry ────────────────────────────────────────────────
-  if (millis() - lastTelemetry > TELEMETRY_INTERVAL) {
+  // Telemetry
+  if (targetActive && (millis() - lastTelemetry > TELEMETRY_INTERVAL)) {
     long count = encoder.getCount();
-    float deg  = count / COUNTS_PER_DEG;
-
-    Serial.print("[T] sv=");       Serial.print(servoAngle);
-    Serial.print(" | pwr=");       Serial.print(currentMotorPower);
+    Serial.print("[T] pwr=");      Serial.print(currentMotorPower);
     Serial.print(" | enc=");       Serial.print(count);
-    Serial.print(" | deg=");       Serial.print(deg, 1);
-    if (targetActive) {
-      Serial.print(" | tgt=");     Serial.print(targetCounts);
-      Serial.print(" | err=");     Serial.print(targetCounts - count);
-    }
-    Serial.println();
-
+    Serial.print(" | err=");       Serial.println(targetCounts - count);
     lastTelemetry = millis();
   }
 }
